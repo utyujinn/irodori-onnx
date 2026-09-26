@@ -3,9 +3,9 @@
 Run [Irodori-TTS](https://github.com/Aratako/Irodori-TTS) (v4.1 MeanFlow, Japanese TTS with zero-shot voice cloning and
 emoji-based style control) **without Python or PyTorch**: convert it to ONNX, then run it from Rust on ONNX Runtime (CUDA).
 
-> **Status: research spike.** The export pipeline works and the numbers below were measured, but the Rust runtime
-> (`crates/irodori-tts`) is still an empty skeleton, and the scripts have not yet been re-verified from a clean checkout.
-> Comments inside the scripts are in Japanese.
+> **Status: research spike.** The export pipeline was re-run end to end from a clean checkout by following this README
+> (fp32 ONNX vs PyTorch: waveform correlation 1.000000; fp16 on CUDA: 0.9996), and the numbers below were measured.
+> The Rust runtime (`crates/irodori-tts`) is still being written. Comments inside the scripts are in Japanese.
 
 Please read [NOTICE.md](NOTICE.md) first: the model has **ethical restrictions** (no voice cloning without consent,
 no deceptive deepfakes), and this project does **not** implement the SilentCipher watermark of the original runtime.
@@ -91,7 +91,7 @@ default `ref1`). Only record or use voices you have the right to use.
 
 ## Roadmap
 
-1. Verify the scripts from a clean checkout and publish the converted fp16 ONNX files on Hugging Face (with the original licenses).
+1. Publish the converted fp16 ONNX files on Hugging Face (with the original licenses).
 2. `crates/irodori-tts`: text normalization, tokenizer (`tokenizers` crate), duration features, MeanFlow sampler, tail trimming,
    loudness normalization and reference-voice registration, ONNX Runtime session management with the memory settings above.
 3. A small CLI (text to wav) and an automatic parity check against the Python ground-truth data.
