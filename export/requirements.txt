@@ -1,0 +1,10 @@
+# Export environment used for the results in the README (Python 3.10, Windows, CUDA 12.8).
+# Install torch first from the CUDA index:
+#   uv pip install "torch==2.10.0" --index-url https://download.pytorch.org/whl/cu128
+# then, because dacvae -> descript-audiotools pins protobuf<3.20 (stale) and conflicts with onnx:
+#   uv pip install --override overrides.txt --prerelease=allow -r requirements.txt
+irodori-tts @ git+https://github.com/Aratako/Irodori-TTS.git@89f9d8fbd4d51ea019867ee1197725ede1df13c5
+onnx
+onnxruntime-gpu
+onnxscript
+soundfile

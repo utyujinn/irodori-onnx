@@ -1,0 +1,10 @@
+target/
+.venv/
+__pycache__/
+# 生成物(ONNX、正解データ、ログ)と参照声はコミットしない
+export/ref/
+export/voices/
+*.onnx
+*.onnx.data
+*.pt
+*.wav

@@ -1,0 +1,9 @@
+[package]
+name = "irodori-tts"
+version = "0.0.0"
+edition = "2021"
+description = "Pure-Rust runtime for Irodori-TTS (v4.1 MeanFlow) on ONNX Runtime. Work in progress."
+license = "MIT"
+publish = false
+
+[dependencies]

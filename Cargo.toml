@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/irodori-tts"]
+resolver = "2"
