@@ -1,0 +1,222 @@
+//! The synthesis pipeline on ONNX Runtime:
+//! text -> tokens -> text encoder -> duration predictor -> MeanFlow sampler (DiT steps) -> codec decoder -> tail trim.
+
+use std::path::{Path, PathBuf};
+
+use ndarray::{s, Array2, Array3};
+use ort::execution_providers::{cuda::ConvAlgorithmSearch, ArenaExtendStrategy, CUDAExecutionProvider};
+use ort::session::{RunOptions, Session};
+use ort::value::{Tensor, TensorRef};
+
+use crate::tokenizer::TextTokenizer;
+use crate::voice::Voice;
+use crate::{postprocess, sampler, text, Error, Result};
+
+/// Output sample rate of the codec decoder.
+pub const SAMPLE_RATE: u32 = 48_000;
+/// Audio samples per latent frame.
+const HOP: usize = 1920;
+const LATENT_DIM: usize = 32;
+const CAPTION_DIM: usize = 512;
+const TIMESTEP_DIM: usize = 512;
+/// The checkpoint's default text length limit (BOS included).
+const MAX_TEXT_LEN: usize = 256;
+/// File stem of the DiT step graph (kept from the export scripts).
+const DIT_GRAPH: &str = "dit_step2";
+
+#[derive(Clone, Debug)]
+pub struct EngineConfig {
+    /// Folder with the ONNX graphs (`text_encoder.onnx`, ... or their `_fp16` variants).
+    pub model_dir: PathBuf,
+    /// The checkpoint's `tokenizer/` folder (`tokenizer.json`, `tokenizer_config.json`).
+    pub tokenizer_dir: PathBuf,
+    /// ONNX Runtime shared library to load. Give it a file name that no other ONNX Runtime in the process uses.
+    /// `None` lets the `ort` crate look it up itself.
+    pub ort_dylib: Option<PathBuf>,
+    /// Use the `_fp16` graphs.
+    pub fp16: bool,
+    /// CUDA device id, or `None` to run on the CPU.
+    pub cuda_device: Option<i32>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SynthOptions {
+    /// Number of sampler steps (the MeanFlow checkpoint defaults to 4).
+    pub steps: usize,
+    pub seed: u64,
+    pub min_seconds: f32,
+    pub max_seconds: f32,
+    /// Multiplies the predicted duration (above 1 speaks slower).
+    pub duration_scale: f32,
+    /// Cut the audio where the generated latent goes flat.
+    pub trim_tail: bool,
+    /// Use this initial noise `(1, frames, 32)` instead of drawing it from `seed` (parity tests).
+    pub noise: Option<Array3<f32>>,
+}
+
+impl Default for SynthOptions {
+    fn default() -> Self {
+        Self { steps: 4, seed: 0, min_seconds: 0.5, max_seconds: 30.0, duration_scale: 1.0, trim_tail: true, noise: None }
+    }
+}
+
+pub struct Synthesis {
+    /// Mono audio at [`SAMPLE_RATE`].
+    pub samples: Vec<f32>,
+    pub sample_rate: u32,
+    /// Number of latent frames that were generated.
+    pub frames: usize,
+    /// The generated latent `(1, frames, 32)` before decoding.
+    pub latent: Array3<f32>,
+}
+
+pub struct Engine {
+    text_encoder: Session,
+    duration: Session,
+    dit: Session,
+    decoder: Session,
+    tokenizer: TextTokenizer,
+    /// Shrinks the CUDA memory arena after every run so the resident VRAM stays low.
+    run_options: RunOptions,
+}
+
+fn build_session(path: &Path, cuda_device: Option<i32>) -> Result<Session> {
+    let mut builder = Session::builder()?;
+    if let Some(device) = cuda_device {
+        // HEURISTIC: the default exhaustive search benchmarks every new input shape, which stalls the decoder for minutes.
+        let cuda = CUDAExecutionProvider::default()
+            .with_device_id(device)
+            .with_conv_algorithm_search(ConvAlgorithmSearch::Heuristic)
+            // Grow the memory arena by what is requested instead of by powers of two: with several sessions and inputs of every
+            // length, power-of-two growth left about a gigabyte of VRAM unused.
+            .with_arena_extend_strategy(ArenaExtendStrategy::SameAsRequested)
+            .build()
+            .error_on_failure();
+        builder = builder.with_execution_providers([cuda])?;
+    }
+    Ok(builder.commit_from_file(path)?)
+}
+
+fn to_array3(value: &ort::value::DynValue) -> Result<Array3<f32>> {
+    let (shape, data) = value.try_extract_tensor::<f32>()?;
+    Ok(Array3::from_shape_vec((shape[0] as usize, shape[1] as usize, shape[2] as usize), data.to_vec())?)
+}
+
+/// Number of latent frames for a predicted log1p(frames), like the Python runtime (round half to even, then clamp).
+fn frames_from_prediction(log1p_frames: f32, opts: &SynthOptions) -> usize {
+    let predicted = log1p_frames.exp_m1() as f64 * opts.duration_scale as f64;
+    let per_second = SAMPLE_RATE as f64 / HOP as f64;
+    let min_frames = ((opts.min_seconds as f64 * per_second).ceil() as usize).max(1);
+    let max_frames = ((opts.max_seconds as f64 * per_second).floor() as usize).max(1);
+    (predicted.round_ties_even().max(0.0) as usize).clamp(min_frames, max_frames)
+}
+
+impl Engine {
+    pub fn new(config: &EngineConfig) -> Result<Self> {
+        if let Some(dylib) = &config.ort_dylib {
+            ort::init_from(dylib.to_string_lossy().as_ref())?.commit();
+        }
+        let suffix = if config.fp16 { "_fp16" } else { "" };
+        let load = |name: &str| build_session(&config.model_dir.join(format!("{name}{suffix}.onnx")), config.cuda_device);
+        let mut run_options = RunOptions::new()?;
+        if let Some(device) = config.cuda_device {
+            run_options.add_config_entry("memory.enable_memory_arena_shrinkage", format!("gpu:{device}"))?;
+        }
+        Ok(Self {
+            text_encoder: load("text_encoder")?,
+            duration: load("duration")?,
+            dit: load(DIT_GRAPH)?,
+            decoder: load("codec_decoder")?,
+            tokenizer: TextTokenizer::from_dir(&config.tokenizer_dir)?,
+            run_options,
+        })
+    }
+
+    pub fn synthesize(&mut self, text: &str, voice: &Voice, opts: &SynthOptions) -> Result<Synthesis> {
+        let normalized = text::normalize_text(text);
+        let normalized = normalized.trim();
+        if normalized.is_empty() {
+            return Err(Error::EmptyText);
+        }
+        let ids = self.tokenizer.encode(normalized, MAX_TEXT_LEN)?;
+        let tokens = ids.len();
+        let ids = Array2::from_shape_vec((1, tokens), ids.iter().map(|&i| i as i64).collect())?;
+        let text_mask = Array2::from_elem((1, tokens), true);
+        let caption_state = Array3::<f32>::zeros((1, 1, CAPTION_DIM));
+        let caption_mask = Array2::from_elem((1, 1), false);
+
+        let text_state = {
+            let out = self.text_encoder.run_with_options(
+                ort::inputs!["input_ids" => Tensor::from_array(ids)?, "mask" => TensorRef::from_array_view(text_mask.view())?],
+                &self.run_options,
+            )?;
+            to_array3(&out[0])?
+        };
+
+        let frames = {
+            let features = text::duration_features(normalized, tokens, MAX_TEXT_LEN, true);
+            let out = self.duration.run_with_options(
+                ort::inputs![
+                    "text_state" => TensorRef::from_array_view(text_state.view())?,
+                    "text_mask" => TensorRef::from_array_view(text_mask.view())?,
+                    "speaker_state" => TensorRef::from_array_view(voice.state.view())?,
+                    "speaker_mask" => TensorRef::from_array_view(voice.mask.view())?,
+                    "duration_features" => Tensor::from_array(Array2::from_shape_vec((1, features.len()), features.to_vec())?)?,
+                    "has_speaker" => Tensor::from_array(ndarray::arr1(&[true]))?,
+                    "caption_state" => TensorRef::from_array_view(caption_state.view())?,
+                    "caption_mask" => TensorRef::from_array_view(caption_mask.view())?,
+                    "has_caption" => Tensor::from_array(ndarray::arr1(&[false]))?
+                ],
+                &self.run_options,
+            )?;
+            let (_, log_frames) = out[0].try_extract_tensor::<f32>()?;
+            frames_from_prediction(log_frames[0], opts)
+        };
+
+        let mut x = match &opts.noise {
+            Some(noise) if noise.shape() == [1, frames, LATENT_DIM] => noise.clone(),
+            Some(noise) => return Err(Error::Model(format!("injected noise has shape {:?}, expected [1, {frames}, {LATENT_DIM}]", noise.shape()))),
+            None => sampler::gaussian_noise(opts.seed, frames, LATENT_DIM),
+        };
+        let schedule = sampler::schedule(opts.steps);
+        for step in 0..opts.steps {
+            let (t, next) = (schedule[step], schedule[step + 1]);
+            let t_embed = Array2::from_shape_vec((1, TIMESTEP_DIM), sampler::timestep_embedding(t, TIMESTEP_DIM))?;
+            let delta_embed = Array2::from_shape_vec((1, TIMESTEP_DIM), sampler::timestep_embedding(t - next, TIMESTEP_DIM))?;
+            let out = self.dit.run_with_options(
+                ort::inputs![
+                    "x_t" => Tensor::from_array(x.clone())?,
+                    "t_embed" => Tensor::from_array(t_embed)?,
+                    "delta_embed" => Tensor::from_array(delta_embed)?,
+                    "text_state" => TensorRef::from_array_view(text_state.view())?,
+                    "text_mask" => TensorRef::from_array_view(text_mask.view())?,
+                    "speaker_state" => TensorRef::from_array_view(voice.state.view())?,
+                    "speaker_mask" => TensorRef::from_array_view(voice.mask.view())?,
+                    "caption_state" => TensorRef::from_array_view(caption_state.view())?,
+                    "caption_mask" => TensorRef::from_array_view(caption_mask.view())?
+                ],
+                &self.run_options,
+            )?;
+            let (_, velocity) = out[0].try_extract_tensor::<f32>()?;
+            let dt = next - t;
+            for (xi, vi) in x.iter_mut().zip(velocity) {
+                *xi += vi * dt;
+            }
+        }
+
+        let mut samples = {
+            let out = self.decoder.run_with_options(ort::inputs!["latent" => TensorRef::from_array_view(x.view())?], &self.run_options)?;
+            let (_, audio) = out[0].try_extract_tensor::<f32>()?;
+            audio.to_vec()
+        };
+        let mut max_samples = frames * HOP;
+        if opts.trim_tail {
+            let flat = postprocess::flattening_point(x.slice(s![0, .., ..]), 20, 0.05, 0.1) * HOP;
+            if flat > 0 {
+                max_samples = max_samples.min(flat);
+            }
+        }
+        samples.truncate(max_samples);
+        Ok(Synthesis { samples, sample_rate: SAMPLE_RATE, frames, latent: x })
+    }
+}

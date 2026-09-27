@@ -27,8 +27,10 @@ class CodecEncode(torch.nn.Module):
         super().__init__()
         self.m = c.model
 
-    def forward(self, wav):  # (1,1,samples) 正規化済み
-        z = self.m.encoder(self.m._pad(wav))
+    def forward(self, wav):  # (1,1,samples) 正規化済みで、長さはhop(1920)の倍数
+        # 元の_padは「余りがあるときだけ右に0を足す」分岐で、そのままexportすると例の長さの側に固定されてしまい、
+        # 長さがちょうどhopの倍数のときに余計な1フレーム分を足してしまう。パディングは呼び出し側(Rust)で行う。
+        z = self.m.encoder(wav)
         mean, _ = self.m.quantizer.in_proj(z).chunk(2, dim=1)
         return mean.transpose(1, 2).contiguous()  # (1,T,32)
 
@@ -37,6 +39,8 @@ data, sr = sf.read(os.path.join(common.VOICES, f"{common.REF_NAMES[0]}.wav"), dt
 wav = torch.from_numpy(data).view(1, 1, -1)
 wav = torchaudio.functional.resample(wav, sr, codec.sample_rate)
 norm = codec._normalize_loudness(wav[0, 0], codec.sample_rate, -16.0).view(1, 1, -1)
+HOP = int(codec.model.hop_length)
+norm = torch.nn.functional.pad(norm, (0, (-norm.shape[-1]) % HOP))  # グラフの外でhopの倍数にそろえる
 expected = torch.load(os.path.join(common.VOICES, f"{common.REF_NAMES[0]}_lat.pt"), weights_only=True)
 with torch.no_grad():
     got = CodecEncode(codec)(norm)[0]
@@ -49,7 +53,7 @@ t0 = time.perf_counter()
 try:
     with torch.no_grad():
         torch.onnx.export(CodecEncode(codec).eval(), (norm,), path, input_names=["wav"], output_names=["latent"],
-                          dynamic_shapes={"wav": {2: Dim("Ns", min=4800, max=48000 * 130)}}, dynamo=True, external_data=True)
+                          dynamic_shapes={"wav": {2: HOP * Dim("K", min=3, max=48000 * 130 // HOP)}}, dynamo=True, external_data=True)
     print(f"exported in {time.perf_counter() - t0:.1f}s")
     import onnxruntime as ort
 
@@ -58,7 +62,7 @@ try:
         o = sess.run(None, {"wav": norm.numpy()})[0][0]
         print(f"{prov[0]}: rel_l2 vs saved latent = {np.linalg.norm(o - expected.numpy()) / np.linalg.norm(expected.numpy()):.2e}")
         # 別の長さでも動くか
-        w2 = np.random.randn(1, 1, 48000 * 3 + 123).astype(np.float32) * 0.05
+        w2 = np.random.randn(1, 1, HOP * 75).astype(np.float32) * 0.05  # hopの倍数(ちょうど境界の長さ)でも動くこと
         print("   other length ok:", sess.run(None, {"wav": w2})[0].shape)
 except Exception as e:  # noqa: BLE001
     import traceback

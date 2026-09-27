@@ -8,3 +8,4 @@ export/voices/
 *.onnx.data
 *.pt
 *.wav
+*.irvc
