@@ -1,0 +1,12 @@
+[package]
+name = "irodori-server"
+version = "0.0.0"
+edition = "2021"
+description = "Runs irodori-tts as a child process that speaks a small framed protocol over stdin/stdout."
+license = "MIT"
+publish = false
+
+[dependencies]
+irodori-tts = { path = "../irodori-tts" }
+hound = "3.5.1"
+serde_json = "1.0.151"

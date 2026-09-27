@@ -1,8 +1,8 @@
 # Third-party models and software
 
-This repository contains **no model weights**. It contains scripts that convert the models below to ONNX, and (planned)
-a Rust runtime that runs them. Converted weights are derivative works and must be distributed together with the
-original license text and copyright notice of each model.
+This repository itself contains **no model weights**: it holds the scripts that convert the models below to ONNX and the Rust
+runtime that runs them. The converted fp16 weights are published separately as assets of the GitHub release `models-v1`,
+together with [MODEL_LICENSES.md](MODEL_LICENSES.md), which holds the original license text and copyright notice of each model.
 
 | Component | License | Notes |
 |---|---|---|

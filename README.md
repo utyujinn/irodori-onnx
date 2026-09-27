@@ -23,7 +23,7 @@ Model: `Aratako/Irodori-TTS-v4.1-Small-MF`, 4 sampling steps. Measured on Window
 | **Rust runtime, fp16 on CUDA** | **24 different sentences, each length seen for the first time: median 0.50 s, max 0.65 s** (second pass: 0.49 s, so there is no first-time penalty). The Python server (same GPU, same setup) takes about 0.8 s. Registering a voice from 3 recordings takes 0.86 s |
 | VRAM, Rust process | about 1 GB after loading, **2.5 GB peak** while synthesizing (the Python server: 3.4 GB resident, 3.7 GB peak) |
 | Size (fp16) | 1.74 GB of ONNX (DiT 749 MB, text 636 MB, speaker 123 MB, decoder 131 MB, encoder 56 MB, duration 44 MB) |
-| Runtime files | `onnxruntime_providers_cuda.dll` 349 MB + minimal NVIDIA runtime 1.84 GB (cuFFT is required; cuDNN `adv`/`runtime_compiled` and NVRTC are not). About 3.1 GB when compressed |
+| Runtime files | `onnxruntime_providers_cuda.dll` 349 MB + minimal NVIDIA runtime 1.84 GB (cuFFT is required, and so are cuDNN `runtime_compiled` and NVRTC for the codec encoder and the Rust decoder; cuDNN `adv` is not). About 3.1 GB when compressed |
 
 ## Things that were not obvious (please keep them in mind if you port other models)
 
@@ -84,6 +84,7 @@ crates/irodori-tts/  Rust runtime
   src/engine.rs                the synthesis pipeline on ONNX Runtime
   src/registrar.rs, audio.rs   reference voice registration: resample, loudness, codec encoder, speaker encoder
   src/sampler.rs, postprocess.rs, voice.rs
+crates/irodori-server/ the same runtime as a child process speaking a framed protocol on stdin/stdout (see src/main.rs)
   examples/synth.rs            command line: register a voice, say a sentence, benchmark
   tests/                       parity tests against the Python ground truth (tests/data/*.json)
 ```
@@ -128,6 +129,19 @@ In code: create a `VoiceRegistrar` once per voice (drop it afterwards to give th
 saved and loaded), and call `Engine::synthesize(text, &voice, &SynthOptions::default())` for every sentence. `Engine` needs
 `&mut self`, so wrap it in a mutex or a worker thread if several callers share it. Requests should be queued and run one at a time.
 
+## Using it from an application that already links another ONNX Runtime binding
+
+The `ort` crate declares `links = "onnxruntime"`, so it cannot share a Cargo graph with another crate that does (for example
+`voicevox_core`, which links its own fork). `irodori-server` runs the same code as a separate executable:
+
+```text
+irodori-server --dir <root>     root/models, root/tokenizer, root/runtime (irodori_onnxruntime.dll, CUDA provider, NVIDIA DLLs)
+```
+
+Requests and responses are frames of `u32 LE header length, JSON header, u32 LE body length, body` on stdin/stdout, with the
+commands `load`, `synthesize` and `register` (documented at the top of `crates/irodori-server/src/main.rs`). Ending the process
+also gives back all of its GPU memory. Mutelink uses it this way.
+
 ## Tests
 
 `cargo test` runs the text tests, which need nothing else. The synthesis and registration tests compare with the Python runtime
@@ -143,7 +157,7 @@ are skipped unless `IRODORI_MODEL_DIR` and `IRODORI_TOKENIZER_DIR` are set (`IRO
 
 ## Roadmap
 
-1. Publish the converted fp16 ONNX files on Hugging Face (with the original licenses).
+1. ~~Publish the converted fp16 ONNX files~~ Done: release `models-v1` (with the original licenses in `MODEL_LICENSES.md`) and `server-v0.1.0` (the `irodori-server` executable).
 2. Rename the DiT graph from `dit_step2` and settle the file layout of a model release.
 3. Streaming per sentence, and a stable public API before publishing the crate.
 
