@@ -14,7 +14,7 @@
 //! one by one, in order. Responses carry `{"ok": true}` or `{"ok": false, "error": "..."}` in the header.
 //!
 //!   {"cmd": "load"}                                          load the synthesis engine (idempotent)
-//!   {"cmd": "synthesize", "text", "voice": <.irvc path>, "duration_scale"?}
+//!   {"cmd": "synthesize", "text", "voice": <.irvc path>, "duration_scale"?, "seed"?}
 //!                                                            -> body: a 16-bit mono WAV
 //!   {"cmd": "register", "out": <.irvc path>, "clips": [{"rate", "samples"}...], "max_seconds"}
 //!                                                            body: 16-bit little-endian mono PCM of all clips back to back
@@ -83,6 +83,9 @@ impl Server {
                 let mut options = SynthOptions::default();
                 if let Some(scale) = request["duration_scale"].as_f64() {
                     options.duration_scale = scale as f32;
+                }
+                if let Some(seed) = request["seed"].as_u64() {
+                    options.seed = seed;
                 }
                 let engine = self.engine.as_mut().ok_or("the engine is not loaded")?;
                 let out = engine.synthesize(text_field("text")?, &voice, &options).map_err(|e| e.to_string())?;
