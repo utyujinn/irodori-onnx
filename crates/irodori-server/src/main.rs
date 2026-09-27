@@ -14,7 +14,7 @@
 //! one by one, in order. Responses carry `{"ok": true, ...}` or `{"ok": false, "error": "..."}` in the header.
 //!
 //!   {"cmd": "load"}                                          load the synthesis engine (idempotent)
-//!   {"cmd": "synthesize", "text", "voice": <.irvc path>, "duration_scale"?, "seed"?, "max_seconds"?, "fade_out_ms"?, "trim_leading_silence"?, "trim_trailing_silence"?}
+//!   {"cmd": "synthesize", "text", "voice": <.irvc path>, "duration_scale"?, "seed"?, "max_seconds"?, "fade_out_ms"?, "trim_leading_silence"?, "trim_trailing_silence"?, "caption"?}
 //!                                     -> header also carries "predicted_seconds" (see Synthesis::predicted_seconds), body: a 16-bit mono WAV
 //!   {"cmd": "register", "out": <.irvc path>, "clips": [{"rate", "samples"}...], "max_seconds"}
 //!                                                            body: 16-bit little-endian mono PCM of all clips back to back
@@ -100,6 +100,9 @@ impl Server {
                 }
                 if let Some(trim) = request["trim_trailing_silence"].as_bool() {
                     options.trim_trailing_silence = trim;
+                }
+                if let Some(caption) = request["caption"].as_str() {
+                    options.caption = Some(caption.to_string());
                 }
                 let engine = self.engine.as_mut().ok_or("the engine is not loaded")?;
                 let out = engine.synthesize(text_field("text")?, &voice, &options).map_err(|e| e.to_string())?;

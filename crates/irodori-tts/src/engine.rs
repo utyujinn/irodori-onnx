@@ -21,6 +21,11 @@ const CAPTION_DIM: usize = 512;
 const TIMESTEP_DIM: usize = 512;
 /// The checkpoint's default text length limit (BOS included).
 const MAX_TEXT_LEN: usize = 256;
+/// The checkpoint itself allows captions up to 512 tokens, but a caption here is meant to be a
+/// short style instruction ("明るく元気に"), not a second sentence — capped much lower as a sanity
+/// bound against a caller pasting something far longer than intended, not because longer captions
+/// wouldn't work.
+const MAX_CAPTION_LEN: usize = 64;
 /// File stem of the DiT step graph (kept from the export scripts).
 const DIT_GRAPH: &str = "dit_step2";
 
@@ -63,6 +68,13 @@ pub struct SynthOptions {
     pub trim_trailing_silence: bool,
     /// Use this initial noise `(1, frames, 32)` instead of drawing it from `seed` (parity tests).
     pub noise: Option<Array3<f32>>,
+    /// A style instruction ("明るく元気に", "落ち着いた口調で", ...) — `None`/empty skips running
+    /// caption_encoder entirely and falls back to the same zero-state/all-False-mask stand-in used
+    /// before this field existed (see synthesize()'s own comment on why that's a safe shortcut, not
+    /// an approximation). Unlike `text`, this is NOT run through text::normalize_text: the Python
+    /// training/export pipeline tokenizes captions raw (see irodori-onnx's export/common.py's
+    /// real_conditions()), since a caption is a style instruction, not something ever spoken aloud.
+    pub caption: Option<String>,
 }
 
 impl Default for SynthOptions {
@@ -78,6 +90,7 @@ impl Default for SynthOptions {
             trim_leading_silence: false,
             trim_trailing_silence: false,
             noise: None,
+            caption: None,
         }
     }
 }
@@ -102,6 +115,7 @@ pub struct Synthesis {
 
 pub struct Engine {
     text_encoder: Session,
+    caption_encoder: Session,
     duration: Session,
     dit: Session,
     decoder: Session,
@@ -159,6 +173,7 @@ impl Engine {
         }
         Ok(Self {
             text_encoder: load("text_encoder")?,
+            caption_encoder: load("caption_encoder")?,
             duration: load("duration")?,
             dit: load(DIT_GRAPH)?,
             decoder: load("codec_decoder")?,
@@ -177,8 +192,30 @@ impl Engine {
         let tokens = ids.len();
         let ids = Array2::from_shape_vec((1, tokens), ids.iter().map(|&i| i as i64).collect())?;
         let text_mask = Array2::from_elem((1, tokens), true);
-        let caption_state = Array3::<f32>::zeros((1, 1, CAPTION_DIM));
-        let caption_mask = Array2::from_elem((1, 1), false);
+        // A caption's mask being all-False is what actually makes it a no-op downstream (both
+        // duration's masked-mean pooling and DiT's attention simply exclude masked-out caption
+        // tokens), not any property of caption_state's own values — that's why the no-caption case
+        // can reuse a fixed zero tensor for caption_state instead of running caption_encoder on an
+        // empty string: the Python export pipeline's own empty-caption baseline confirmed this
+        // (real_conditions() in irodori-onnx's export/common.py forces the mask to all-False by
+        // hand rather than relying on the encoder's actual output for ""). has_caption is a second,
+        // coarser gate the duration predictor alone reads (see _caption_vec in the Python model):
+        // it ANDs with caption_mask, so it's really just "ignore the caption entirely" spelled out
+        // as its own flag instead of relying on every mask entry happening to be False.
+        let (caption_state, caption_mask, has_caption) = match opts.caption.as_deref().map(str::trim) {
+            Some(caption) if !caption.is_empty() => {
+                let cap_ids = self.tokenizer.encode(caption, MAX_CAPTION_LEN)?;
+                let cap_tokens = cap_ids.len();
+                let cap_ids = Array2::from_shape_vec((1, cap_tokens), cap_ids.iter().map(|&i| i as i64).collect())?;
+                let cap_mask = Array2::from_elem((1, cap_tokens), true);
+                let out = self.caption_encoder.run_with_options(
+                    ort::inputs!["input_ids" => Tensor::from_array(cap_ids)?, "mask" => TensorRef::from_array_view(cap_mask.view())?],
+                    &self.run_options,
+                )?;
+                (to_array3(&out[0])?, cap_mask, true)
+            }
+            _ => (Array3::<f32>::zeros((1, 1, CAPTION_DIM)), Array2::from_elem((1, 1), false), false),
+        };
 
         let text_state = {
             let out = self.text_encoder.run_with_options(
@@ -200,7 +237,7 @@ impl Engine {
                     "has_speaker" => Tensor::from_array(ndarray::arr1(&[true]))?,
                     "caption_state" => TensorRef::from_array_view(caption_state.view())?,
                     "caption_mask" => TensorRef::from_array_view(caption_mask.view())?,
-                    "has_caption" => Tensor::from_array(ndarray::arr1(&[false]))?
+                    "has_caption" => Tensor::from_array(ndarray::arr1(&[has_caption]))?
                 ],
                 &self.run_options,
             )?;

@@ -65,11 +65,19 @@ print("wrapper vs reference: max|diff| =", float((check - ref["out"]).abs().max(
 from torch.export import Dim
 
 T, L, S = Dim("T", min=2, max=2048), Dim("L", min=1, max=512), Dim("S", min=2, max=1024)
+# caption_state/caption_mask used to be exported as fixed shape (1, 1, 512)/(1, 1) — the only shape
+# dit_step_ref.pt's reference ever had, since it comes from the empty-caption baseline
+# (common.py's real_conditions() always forces an empty caption). That silently baked "caption
+# sequence length is always exactly 1" into the graph, which only breaks once a real (multi-token)
+# caption is actually used (TASK.md 26番) — a dynamic C dim here, separate from L (text) and S
+# (speaker), lets a real caption of any length flow through the same graph the empty-caption
+# shortcut already uses (see engine.rs's own comment on why the empty case still stays static).
+C = Dim("C", min=1, max=512)
 dynamic_shapes = {
     "x_t": {1: T}, "t_embed": None, "delta_embed": None,
     "text_state": {1: L}, "text_mask": {1: L},
     "speaker_state": {1: S}, "speaker_mask": {1: S},
-    "caption_state": None, "caption_mask": None,
+    "caption_state": {1: C}, "caption_mask": {1: C},
 }
 out_path = os.path.join(common.REF_DIR, "dit_step2.onnx")
 t0 = time.perf_counter()

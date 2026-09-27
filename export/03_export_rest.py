@@ -86,6 +86,7 @@ def export_and_check(name, module, args, input_names, output_names, dynamic_shap
                     errs.append(f"rel_l2={np.linalg.norm(o - e) / (np.linalg.norm(e) + 1e-12):.2e}")
             row.append(f"{prov[0][:4]}: " + ",".join(errs))
         results.append(row)
+        print(" | ".join(row))  # printed immediately too, in case a later branch's own setup crashes before SUMMARY
     except Exception as e:  # noqa: BLE001
         traceback.print_exc()
         results.append([name, f"FAILED {type(e).__name__}: {str(e)[:200]}"])
@@ -112,6 +113,33 @@ export_and_check("text_encoder", TextBranch(model), (ids, mask), ["input_ids", "
                  {"input_ids": {1: L}, "mask": {1: L}}, [exp_text])
 
 
+# ---- 1b. キャプション: token ids -> caption_state。text_encoderと全く同じ形
+# (ModernBERTバックボーン + PretrainedConditionProjector + RMSNorm)だが、text_encoder/text_normとは
+# 別に学習された重み(model.caption_encoder/model.caption_norm)を使う。空キャプション(常時ゼロ+
+# マスク全部False)は既にRust側にハードコードして動いているので(TASK.md 24番Phase 0)、ここでは
+# 実際に非空のキャプション文字列を通した場合の出力だけを検証する — 空キャプションのref["cap_state"]
+# のような既存の保存済み参照値は無い(01_make_step_reference.pyは常に空キャプションで作っているため)。
+class CaptionBranch(torch.nn.Module):
+    def __init__(self, m):
+        super().__init__()
+        self.m = m
+
+    def forward(self, input_ids, mask):
+        return self.m.caption_norm(self.m.caption_encoder(self.m.pretrained_text_backbone, input_ids, mask))
+
+
+# rt.caption_tokenizer.batch_encode()は生の文字列をそのままトークナイズする
+# (normalize_textは通さない。common.pyのreal_conditions()と同じ扱い) — キャプションは読み上げる
+# テキストではなくスタイル指示なので、話速表現の正規化はそもそも不要。
+CAPTION = "明るく元気に"
+cap_ids, cap_mask = rt.caption_tokenizer.batch_encode([CAPTION])
+with torch.no_grad():
+    exp_cap = CaptionBranch(model)(cap_ids, cap_mask)
+print("caption branch output shape:", tuple(exp_cap.shape))
+export_and_check("caption_encoder", CaptionBranch(model), (cap_ids, cap_mask), ["input_ids", "mask"], ["caption_state"],
+                 {"input_ids": {1: L}, "mask": {1: L}}, [exp_cap])
+
+
 # ---- 2. 参照声: patched reference latent (1,N,32)+mask -> speaker_state, speaker_mask
 class SpeakerBranch(torch.nn.Module):
     def __init__(self, m):
@@ -132,7 +160,13 @@ ref_latent = patchify_latent(lat.unsqueeze(0), model.cfg.latent_patch_size)
 ref_mask = torch.ones(ref_latent.shape[:2], dtype=torch.bool)
 with torch.no_grad():
     exp_spk, exp_spk_mask = SpeakerBranch(model)(ref_latent, ref_mask)
-print("speaker branch check vs stored reference:", float((exp_spk - ref["spk_state"]).abs().max()))
+# Only meaningful when IRODORI_REF_VOICES/IRODORI_VOICES_DIR point at the exact voice(s)
+# 01_make_step_reference.py used to build dit_step_ref.pt — a different (but still valid) reference
+# voice just has a different frame count, which isn't an error in SpeakerBranch's own export.
+try:
+    print("speaker branch check vs stored reference:", float((exp_spk - ref["spk_state"]).abs().max()))
+except RuntimeError as e:
+    print(f"speaker branch check vs stored reference: skipped ({e})")
 N = Dim("N", min=8, max=4096)
 export_and_check("speaker_encoder", SpeakerBranch(model), (ref_latent, ref_mask), ["ref_latent", "ref_mask"], ["speaker_state", "speaker_mask"],
                  {"ref_latent": {1: N}, "ref_mask": {1: N}}, [exp_spk, exp_spk_mask])
@@ -162,11 +196,15 @@ with torch.no_grad():
     exp_dur = DurationBranch(model)(*dargs)
 print("duration log_frames:", exp_dur.tolist(), "-> frames", float(exp_dur.exp()))
 S = Dim("S", min=2, max=1024)
+# caption_state/caption_mask were static (fixed at the empty-caption baseline's shape (1,1,512)/
+# (1,1)) for the same reason dit_step2's own caption dims were — see 02_export_dit_step.py's C
+# comment for the full story (TASK.md 26番).
+C = Dim("C", min=1, max=512)
 export_and_check("duration", DurationBranch(model), dargs,
                  ["text_state", "text_mask", "speaker_state", "speaker_mask", "duration_features", "has_speaker", "caption_state", "caption_mask", "has_caption"],
                  ["log_frames"],
                  {"text_state": {1: L}, "text_mask": {1: L}, "speaker_state": {1: S}, "speaker_mask": {1: S}, "duration_features": None,
-                  "has_speaker": None, "caption_state": None, "caption_mask": None, "has_caption": None}, [exp_dur])
+                  "has_speaker": None, "caption_state": {1: C}, "caption_mask": {1: C}, "has_caption": None}, [exp_dur])
 
 
 # ---- 4. コーデックのデコーダ: latent (1,T,32) -> audio (1,1,samples)

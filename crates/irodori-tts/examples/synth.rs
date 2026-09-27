@@ -1,7 +1,7 @@
 //! Small command line front end.
 //!
 //!   synth register <voice.irvc> <recording.wav>...   register a reference voice from one or more WAV files
-//!   synth say <voice.irvc> "<text>" <out.wav> [--seed N] [--steps N] [--repeat N]
+//!   synth say <voice.irvc> "<text>" <out.wav> [--seed N] [--steps N] [--repeat N] [--caption "<style>"]
 //!   synth bench <voice.irvc> <lines.txt>              synthesize every line twice and report the timing of both passes
 //!                                                     (pass 1 sees every input length for the first time)
 //!
@@ -67,7 +67,13 @@ fn main() {
         }
         Some("say") if args.len() >= 4 => {
             let option = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<usize>().ok());
-            let options = SynthOptions { seed: option("--seed").unwrap_or(0) as u64, steps: option("--steps").unwrap_or(4), ..SynthOptions::default() };
+            let string_option = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+            let options = SynthOptions {
+                seed: option("--seed").unwrap_or(0) as u64,
+                steps: option("--steps").unwrap_or(4),
+                caption: string_option("--caption"),
+                ..SynthOptions::default()
+            };
             let voice = Voice::load(&args[1]).unwrap();
             let started = Instant::now();
             let mut engine = Engine::new(&config()).unwrap();
