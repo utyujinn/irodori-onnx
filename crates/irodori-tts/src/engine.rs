@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use ndarray::{s, Array2, Array3};
 use ort::execution_providers::{cuda::ConvAlgorithmSearch, ArenaExtendStrategy, CUDAExecutionProvider};
+use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
 use ort::session::{RunOptions, Session};
 use ort::value::{Tensor, TensorRef};
 
@@ -125,7 +126,14 @@ pub struct Engine {
 }
 
 fn build_session(path: &Path, cuda_device: Option<i32>) -> Result<Session> {
-    let mut builder = Session::builder()?;
+    // Graph optimization is already at its max level (Level3/"All") by default (ort's own docs:
+    // "All optimizations are enabled by default") — nothing to configure there. Memory pattern
+    // optimization, on the other hand, is also on by default but ort's own doc for it says to turn
+    // it off "if the input size varies" — which is every call here: text length, frame count, and
+    // (since TASK.md #26) caption length are all different per request, never a stable batch shape
+    // to build a reusable memory plan around, so leaving it on works against its own assumption
+    // rather than helping.
+    let mut builder = Session::builder()?.with_memory_pattern(false)?;
     if let Some(device) = cuda_device {
         // HEURISTIC: the default exhaustive search benchmarks every new input shape, which stalls the decoder for minutes.
         let cuda = CUDAExecutionProvider::default()
@@ -251,24 +259,35 @@ impl Engine {
             None => sampler::gaussian_noise(opts.seed, frames, LATENT_DIM),
         };
         let schedule = sampler::schedule(opts.steps);
+        // text_state/text_mask/speaker_state/speaker_mask/caption_state/caption_mask are identical
+        // on every one of opts.steps (4 by default) DiT calls — only x_t/t_embed/delta_embed change
+        // step to step. Plain run_with_options re-uploads every input fresh each call, so on CUDA
+        // these six tensors were being copied host->device 4 times over for no reason. IoBinding
+        // lets them be uploaded once and reused for the rest of the loop (see ort's own io_binding
+        // module docs: "Models that accept an input that does not change for multiple subsequent
+        // runs" is exactly this shape of problem). Only the per-step inputs are (re-)bound inside
+        // the loop; outputs are left unbound (still freshly allocated each call, same as before) —
+        // binding only what's actually constant keeps this change to the one thing it's for.
+        // RunWithBinding (unlike plain Run) needs at least one output explicitly registered, so
+        // velocity is bound to plain host memory too — the same place try_extract_tensor below
+        // would have had to copy it to anyway even unbound, so this isn't a new copy, just an
+        // explicit version of one that was always happening.
+        let mut dit_binding = self.dit.create_binding()?;
+        dit_binding.bind_input("text_state", &Tensor::from_array(text_state.clone())?)?;
+        dit_binding.bind_input("text_mask", &Tensor::from_array(text_mask.clone())?)?;
+        dit_binding.bind_input("speaker_state", &Tensor::from_array(voice.state.clone())?)?;
+        dit_binding.bind_input("speaker_mask", &Tensor::from_array(voice.mask.clone())?)?;
+        dit_binding.bind_input("caption_state", &Tensor::from_array(caption_state.clone())?)?;
+        dit_binding.bind_input("caption_mask", &Tensor::from_array(caption_mask.clone())?)?;
+        dit_binding.bind_output_to_device("velocity", &MemoryInfo::new(AllocationDevice::CPU, 0, AllocatorType::Device, MemoryType::CPUOutput)?)?;
         for step in 0..opts.steps {
             let (t, next) = (schedule[step], schedule[step + 1]);
             let t_embed = Array2::from_shape_vec((1, TIMESTEP_DIM), sampler::timestep_embedding(t, TIMESTEP_DIM))?;
             let delta_embed = Array2::from_shape_vec((1, TIMESTEP_DIM), sampler::timestep_embedding(t - next, TIMESTEP_DIM))?;
-            let out = self.dit.run_with_options(
-                ort::inputs![
-                    "x_t" => Tensor::from_array(x.clone())?,
-                    "t_embed" => Tensor::from_array(t_embed)?,
-                    "delta_embed" => Tensor::from_array(delta_embed)?,
-                    "text_state" => TensorRef::from_array_view(text_state.view())?,
-                    "text_mask" => TensorRef::from_array_view(text_mask.view())?,
-                    "speaker_state" => TensorRef::from_array_view(voice.state.view())?,
-                    "speaker_mask" => TensorRef::from_array_view(voice.mask.view())?,
-                    "caption_state" => TensorRef::from_array_view(caption_state.view())?,
-                    "caption_mask" => TensorRef::from_array_view(caption_mask.view())?
-                ],
-                &self.run_options,
-            )?;
+            dit_binding.bind_input("x_t", &Tensor::from_array(x.clone())?)?;
+            dit_binding.bind_input("t_embed", &Tensor::from_array(t_embed)?)?;
+            dit_binding.bind_input("delta_embed", &Tensor::from_array(delta_embed)?)?;
+            let out = self.dit.run_binding_with_options(&dit_binding, &self.run_options)?;
             let (_, velocity) = out[0].try_extract_tensor::<f32>()?;
             let dt = next - t;
             for (xi, vi) in x.iter_mut().zip(velocity) {
