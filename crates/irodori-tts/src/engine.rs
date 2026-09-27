@@ -138,6 +138,11 @@ fn frames_from_prediction(log1p_frames: f32, opts: &SynthOptions) -> usize {
     let per_second = SAMPLE_RATE as f64 / HOP as f64;
     let min_frames = ((opts.min_seconds as f64 * per_second).ceil() as usize).max(1);
     let max_frames = ((opts.max_seconds as f64 * per_second).floor() as usize).max(1);
+    // `Ord::clamp` panics if min > max, which a caller-supplied `max_seconds` below
+    // `min_seconds` (e.g. a per-text cap computed without accounting for a duration_scale
+    // that shrinks it further) would reach; min_seconds wins since it is the sampler's own
+    // floor, not something a caller-side cap is meant to override.
+    let max_frames = max_frames.max(min_frames);
     (predicted.round_ties_even().max(0.0) as usize).clamp(min_frames, max_frames)
 }
 
