@@ -75,7 +75,16 @@ def drop_roundtrip_casts(m):
 
 
 R = os.path.join(os.path.dirname(__file__), "ref")
-names = sys.argv[1:] or ["text_encoder", "speaker_encoder", "duration", "dit_step", "codec_decoder", "codec_encoder"]
+# codec_encoder is deliberately NOT in this default list: its fp16 output on CUDA diverges from the
+# PyTorch reference by ~13% (vs ~0.1% on CPU with the exact same weights) — bisecting found no single
+# bad op to block-list the way norm_block_list handles RMSNorm's overflow, just ordinary per-layer
+# fp16 rounding differences between CUDA's and CPU's Conv/Snake-activation kernels compounding
+# additively across ~30 stacked residual blocks in its DACVAE conv stack. registrar.rs (irodori-tts)
+# always loads the plain fp32 codec_encoder.onnx instead — it only runs once per voice registration,
+# never per-synthesis, so trading its speed for fp32's correctness costs nothing that matters (see
+# Mutelink TASK.md #10 for the full investigation). Pass it explicitly on the command line if you
+# specifically want an (unused-by-anything) fp16 copy for comparison.
+names = sys.argv[1:] or ["text_encoder", "speaker_encoder", "duration", "dit_step", "codec_decoder"]
 for n in names:
     src = os.path.join(R, f"{n}.onnx")
     dst = os.path.join(R, f"{n}_fp16.onnx")

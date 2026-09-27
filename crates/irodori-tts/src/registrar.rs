@@ -58,7 +58,20 @@ impl VoiceRegistrar {
             run_options.add_config_entry("memory.enable_memory_arena_shrinkage", format!("gpu:{device}"))?;
         }
         Ok(Self {
-            codec_encoder: build_session(&config.model_dir.join(format!("codec_encoder{suffix}.onnx")), config.cuda_device)?,
+            // codec_encoder always loads the fp32 file, never `_fp16`, unlike every other graph
+            // (Mutelink TASK.md #10): its DACVAE conv stack's fp16-on-CUDA output diverges from the
+            // PyTorch reference by ~13% (vs ~0.1% on CPU with the exact same fp16 weights) — bisecting
+            // it found no single bad op, just ordinary per-layer fp16 rounding differences between
+            // CUDA's and CPU's Conv/Snake-activation kernels compounding additively across the ~30
+            // stacked residual blocks, so there's no small block-list fix the way RMSNorm's overflow
+            // had (see norm_block_list/weight_norm_block_list in irodori-onnx's export/06_fp16.py,
+            // which were tried first and didn't move this number). codec_encoder only runs once per
+            // voice registration, never per-synthesis, so trading its speed for fp32's correctness
+            // here doesn't cost anything that matters. speaker_encoder shares fp16's suffix as before —
+            // tested in isolation with the same synthetic input, it agrees with CPU to ~0.3%, the
+            // registration test's own large speaker_state error traced back entirely to it being fed
+            // codec_encoder's already-wrong latent, not a problem of its own.
+            codec_encoder: build_session(&config.model_dir.join("codec_encoder.onnx"), config.cuda_device)?,
             speaker_encoder: build_session(&config.model_dir.join(format!("speaker_encoder{suffix}.onnx")), config.cuda_device)?,
             run_options,
         })
