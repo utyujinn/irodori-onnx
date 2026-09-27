@@ -11,11 +11,11 @@
 //! (`irodori_onnxruntime.dll` and the CUDA provider with its NVIDIA DLLs).
 //!
 //! A frame is `u32 LE header length, header (JSON), u32 LE body length, body`, in both directions. Requests are answered
-//! one by one, in order. Responses carry `{"ok": true}` or `{"ok": false, "error": "..."}` in the header.
+//! one by one, in order. Responses carry `{"ok": true, ...}` or `{"ok": false, "error": "..."}` in the header.
 //!
 //!   {"cmd": "load"}                                          load the synthesis engine (idempotent)
-//!   {"cmd": "synthesize", "text", "voice": <.irvc path>, "duration_scale"?, "seed"?}
-//!                                                            -> body: a 16-bit mono WAV
+//!   {"cmd": "synthesize", "text", "voice": <.irvc path>, "duration_scale"?, "seed"?, "max_seconds"?, "fade_out_ms"?, "trim_leading_silence"?, "trim_trailing_silence"?}
+//!                                     -> header also carries "predicted_seconds" (see Synthesis::predicted_seconds), body: a 16-bit mono WAV
 //!   {"cmd": "register", "out": <.irvc path>, "clips": [{"rate", "samples"}...], "max_seconds"}
 //!                                                            body: 16-bit little-endian mono PCM of all clips back to back
 //!
@@ -69,14 +69,16 @@ struct Server {
 }
 
 impl Server {
-    fn handle(&mut self, request: &Value, body: &[u8]) -> Result<Vec<u8>, String> {
+    // The Ok side is (extra response-header fields, body) — only "synthesize" has anything to
+    // report beyond "ok": true (predicted_seconds; see Synthesis::predicted_seconds' own comment).
+    fn handle(&mut self, request: &Value, body: &[u8]) -> Result<(Value, Vec<u8>), String> {
         let text_field = |name: &str| request[name].as_str().ok_or_else(|| format!("missing \"{name}\""));
         match request["cmd"].as_str() {
             Some("load") => {
                 if self.engine.is_none() {
                     self.engine = Some(Engine::new(&self.config).map_err(|e| e.to_string())?);
                 }
-                Ok(Vec::new())
+                Ok((json!({}), Vec::new()))
             }
             Some("synthesize") => {
                 let voice = Voice::load(text_field("voice")?).map_err(|e| e.to_string())?;
@@ -87,9 +89,22 @@ impl Server {
                 if let Some(seed) = request["seed"].as_u64() {
                     options.seed = seed;
                 }
+                if let Some(max_seconds) = request["max_seconds"].as_f64() {
+                    options.max_seconds = max_seconds as f32;
+                }
+                if let Some(ms) = request["fade_out_ms"].as_f64() {
+                    options.fade_out_ms = ms as f32;
+                }
+                if let Some(trim) = request["trim_leading_silence"].as_bool() {
+                    options.trim_leading_silence = trim;
+                }
+                if let Some(trim) = request["trim_trailing_silence"].as_bool() {
+                    options.trim_trailing_silence = trim;
+                }
                 let engine = self.engine.as_mut().ok_or("the engine is not loaded")?;
                 let out = engine.synthesize(text_field("text")?, &voice, &options).map_err(|e| e.to_string())?;
-                wav_bytes(&out.samples, out.sample_rate)
+                let wav = wav_bytes(&out.samples, out.sample_rate)?;
+                Ok((json!({ "predicted_seconds": out.predicted_seconds }), wav))
             }
             Some("register") => {
                 let mut budget = request["max_seconds"].as_f64().ok_or("missing \"max_seconds\"")? as f32;
@@ -114,7 +129,7 @@ impl Server {
                 let clips: Vec<Clip> = recordings.iter().map(|(samples, rate)| Clip { samples, sample_rate: *rate }).collect();
                 let voice = registrar.register(&clips).map_err(|e| e.to_string())?;
                 voice.save(text_field("out")?).map_err(|e| e.to_string())?;
-                Ok(Vec::new())
+                Ok((json!({}), Vec::new()))
             }
             other => Err(format!("unknown command {other:?}")),
         }
@@ -142,7 +157,10 @@ fn main() -> io::Result<()> {
     let (mut input, mut output) = (io::stdin().lock(), io::stdout().lock());
     while let Some((request, body)) = read_frame(&mut input)? {
         let (header, body) = match server.handle(&request, &body) {
-            Ok(body) => (json!({ "ok": true }), body),
+            Ok((mut extra, body)) => {
+                extra["ok"] = json!(true);
+                (extra, body)
+            }
             Err(error) => (json!({ "ok": false, "error": error }), Vec::new()),
         };
         write_frame(&mut output, &header, &body)?;

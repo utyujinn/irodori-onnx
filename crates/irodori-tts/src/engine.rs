@@ -50,13 +50,35 @@ pub struct SynthOptions {
     pub duration_scale: f32,
     /// Cut the audio where the generated latent goes flat.
     pub trim_tail: bool,
+    /// Fade the last this many milliseconds to zero at the tail-trim cut, instead of a hard
+    /// truncation (which is itself an audible click/burst of noise; see postprocess::fade_out).
+    /// `0.0` (the default, and what the parity tests use) disables it, matching the Python
+    /// runtime's own output exactly.
+    pub fade_out_ms: f32,
+    /// Trim leading near-silence from the decoded audio (see postprocess::leading_silence).
+    /// `false` by default, again to keep the parity tests' output identical to the Python runtime.
+    pub trim_leading_silence: bool,
+    /// Trim trailing near-silence the latent-based `trim_tail` left behind (see
+    /// postprocess::trailing_silence). `false` by default, same reasoning.
+    pub trim_trailing_silence: bool,
     /// Use this initial noise `(1, frames, 32)` instead of drawing it from `seed` (parity tests).
     pub noise: Option<Array3<f32>>,
 }
 
 impl Default for SynthOptions {
     fn default() -> Self {
-        Self { steps: 4, seed: 0, min_seconds: 0.5, max_seconds: 30.0, duration_scale: 1.0, trim_tail: true, noise: None }
+        Self {
+            steps: 4,
+            seed: 0,
+            min_seconds: 0.5,
+            max_seconds: 30.0,
+            duration_scale: 1.0,
+            trim_tail: true,
+            fade_out_ms: 0.0,
+            trim_leading_silence: false,
+            trim_trailing_silence: false,
+            noise: None,
+        }
     }
 }
 
@@ -66,6 +88,14 @@ pub struct Synthesis {
     pub sample_rate: u32,
     /// Number of latent frames that were generated.
     pub frames: usize,
+    /// `frames` as seconds, i.e. the duration predictor's decision (after `duration_scale`,
+    /// before tail-trim/fade/leading-silence trim) — the full length the model committed to
+    /// generating for this text, not what ended up in `samples`. Exposed so a caller can compare
+    /// it with the input text's length: an occasional bad prediction runs far longer than the
+    /// text warrants and the model fills the excess with degraded audio rather than clean
+    /// silence, which is otherwise indistinguishable from a normal, correctly-paced render until
+    /// something actually inspects the audio or listens to it.
+    pub predicted_seconds: f32,
     /// The generated latent `(1, frames, 32)` before decoding.
     pub latent: Array3<f32>,
 }
@@ -217,6 +247,29 @@ impl Engine {
             }
         }
         samples.truncate(max_samples);
-        Ok(Synthesis { samples, sample_rate: SAMPLE_RATE, frames, latent: x })
+        if opts.trim_trailing_silence {
+            // Same window/threshold as trim_leading_silence below, for the same reasons; a larger
+            // margin than that one's cap, kept past the last real sound, since a breath or a
+            // consonant's natural decay trailing off is still part of the utterance, not padding.
+            let window = (0.01 * SAMPLE_RATE as f32) as usize;
+            let margin = (0.15 * SAMPLE_RATE as f32) as usize;
+            let cut = postprocess::trailing_silence(&samples, window, 0.01, margin);
+            samples.truncate(cut);
+        }
+        if opts.fade_out_ms > 0.0 {
+            postprocess::fade_out(&mut samples, (opts.fade_out_ms / 1000.0 * SAMPLE_RATE as f32) as usize);
+        }
+        if opts.trim_leading_silence {
+            // A window short enough to not eat into a genuine soft onset, a threshold well below
+            // normal speech level, and a cap far more generous than any pre-speech lead-in the
+            // model has been observed to produce, so a mistuned detector fails safe (too little
+            // trimmed) rather than clipping real content.
+            let window = (0.01 * SAMPLE_RATE as f32) as usize;
+            let cap = (0.4 * SAMPLE_RATE as f32) as usize;
+            let lead = postprocess::leading_silence(&samples, window, 0.01, cap);
+            samples.drain(..lead);
+        }
+        let predicted_seconds = (frames * HOP) as f32 / SAMPLE_RATE as f32;
+        Ok(Synthesis { samples, sample_rate: SAMPLE_RATE, frames, predicted_seconds, latent: x })
     }
 }
