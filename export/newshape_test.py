@@ -13,10 +13,13 @@ caption_encoder_fp16.onnx, duration_fp16.onnx, dit_step2_fp16.onnx, codec_decode
 """
 
 import os
+import sys
 import time
 
 import numpy as np
 import onnxruntime as ort
+
+sys.stdout.reconfigure(encoding="utf-8")  # Windows console default (cp932) can't encode "—" etc.
 
 R = os.path.join(os.path.dirname(__file__), "ref")
 # engine.rsのbuild_sessionと同じ設定(HEURISTIC: 既定のEXHAUSTIVEは新しい形状ごとに総当たりベンチマーク
