@@ -114,4 +114,26 @@ impl VoiceRegistrar {
         let (_, mask) = out[1].try_extract_tensor::<bool>()?;
         Voice::from_parts(state.to_vec(), state_shape[1] as usize, state_shape[2] as usize, mask.to_vec())
     }
+
+    /// A [`Voice`] with no speaker conditioning at all — Irodori's own upstream "--no-ref" inference
+    /// mode (Aratako/Irodori-TTS's `inference_runtime.py`, `_load_reference_latent`), so an
+    /// application can synthesize without requiring the user to register a reference voice first.
+    /// The reference implementation still runs the speaker encoder rather than skipping it — on a
+    /// zero-filled latent with an *all-False* mask (`ref_len = max(1, speaker_patch_size)`, which
+    /// defaults to 1 upstream and is used as-is here since nothing in that single frame is ever
+    /// attended to). An all-False mask is exactly the same "nothing here" signal this crate's own
+    /// caption branch already relies on for an empty caption, propagated through `speaker_mask` into
+    /// the DiT step the same way. `codec_encoder` (needed only to turn real audio into a latent) is
+    /// never touched — there is no audio here to encode.
+    pub fn register_no_reference(&mut self) -> Result<Voice> {
+        let ref_latent = Array3::<f32>::zeros((1, 1, LATENT_DIM));
+        let ref_mask = Array2::from_elem((1, 1), false);
+        let out = self.speaker_encoder.run_with_options(
+            ort::inputs!["ref_latent" => Tensor::from_array(ref_latent)?, "ref_mask" => Tensor::from_array(ref_mask)?],
+            &self.run_options,
+        )?;
+        let (state_shape, state) = out[0].try_extract_tensor::<f32>()?;
+        let (_, mask) = out[1].try_extract_tensor::<bool>()?;
+        Voice::from_parts(state.to_vec(), state_shape[1] as usize, state_shape[2] as usize, mask.to_vec())
+    }
 }

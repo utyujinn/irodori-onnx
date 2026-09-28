@@ -18,6 +18,8 @@
 //!                                     -> header also carries "predicted_seconds" (see Synthesis::predicted_seconds), body: a 16-bit mono WAV
 //!   {"cmd": "register", "out": <.irvc path>, "clips": [{"rate", "samples"}...], "max_seconds"}
 //!                                                            body: 16-bit little-endian mono PCM of all clips back to back
+//!   {"cmd": "register_no_reference", "out": <.irvc path>}    no body — a Voice with no speaker
+//!                                                            conditioning at all (see VoiceRegistrar::register_no_reference)
 //!
 //! stdout carries nothing but frames; diagnostics go to stderr.
 
@@ -131,6 +133,12 @@ impl Server {
                 let mut registrar = VoiceRegistrar::new(&self.config).map_err(|e| e.to_string())?;
                 let clips: Vec<Clip> = recordings.iter().map(|(samples, rate)| Clip { samples, sample_rate: *rate }).collect();
                 let voice = registrar.register(&clips).map_err(|e| e.to_string())?;
+                voice.save(text_field("out")?).map_err(|e| e.to_string())?;
+                Ok((json!({}), Vec::new()))
+            }
+            Some("register_no_reference") => {
+                let mut registrar = VoiceRegistrar::new(&self.config).map_err(|e| e.to_string())?;
+                let voice = registrar.register_no_reference().map_err(|e| e.to_string())?;
                 voice.save(text_field("out")?).map_err(|e| e.to_string())?;
                 Ok((json!({}), Vec::new()))
             }
