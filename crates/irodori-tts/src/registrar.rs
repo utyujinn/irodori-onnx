@@ -18,6 +18,12 @@ const HOP: usize = 1920;
 const LATENT_DIM: usize = 32;
 /// The checkpoint limits the reference to 120 seconds.
 const MAX_REFERENCE_FRAMES: usize = 120 * SAMPLE_RATE as usize / HOP;
+/// `speaker_encoder.onnx`'s reference-frame patch size. Verified empirically (not just assumed from
+/// upstream's `ModelConfig` class default of 1, which this checkpoint does not actually use): feeding
+/// `ref_latent`/`ref_mask` with `N` frames to `speaker_encoder.onnx` directly and bisecting `N` shows
+/// `N` in 1..=3 fails inside the graph (an internal patchify op collapses to a zero-length sequence,
+/// `N // 4 == 0`) while `N == 4` is the smallest value that succeeds. See [`VoiceRegistrar::register_no_reference`].
+const SPEAKER_PATCH_SIZE: usize = 4;
 
 /// A mono recording. Mix multi-channel audio down before passing it in.
 pub struct Clip<'a> {
@@ -119,15 +125,18 @@ impl VoiceRegistrar {
     /// mode (Aratako/Irodori-TTS's `inference_runtime.py`, `_load_reference_latent`), so an
     /// application can synthesize without requiring the user to register a reference voice first.
     /// The reference implementation still runs the speaker encoder rather than skipping it — on a
-    /// zero-filled latent with an *all-False* mask (`ref_len = max(1, speaker_patch_size)`, which
-    /// defaults to 1 upstream and is used as-is here since nothing in that single frame is ever
-    /// attended to). An all-False mask is exactly the same "nothing here" signal this crate's own
-    /// caption branch already relies on for an empty caption, propagated through `speaker_mask` into
-    /// the DiT step the same way. `codec_encoder` (needed only to turn real audio into a latent) is
-    /// never touched — there is no audio here to encode.
+    /// zero-filled latent with an *all-False* mask, `ref_len = SPEAKER_PATCH_SIZE` frames (one whole
+    /// patch; nothing in it is ever attended to, so its content doesn't matter, only its length —
+    /// upstream's `ModelConfig` default of `speaker_patch_size=1` does NOT hold for this checkpoint,
+    /// confirmed by feeding `speaker_encoder.onnx` directly: `ref_len` 1..=3 fails inside the graph
+    /// with a zero-length intermediate tensor, `ref_len=4` is the smallest that succeeds). An
+    /// all-False mask is exactly the same "nothing here" signal this crate's own caption branch
+    /// already relies on for an empty caption, propagated through `speaker_mask` into the DiT step
+    /// the same way. `codec_encoder` (needed only to turn real audio into a latent) is never touched
+    /// — there is no audio here to encode.
     pub fn register_no_reference(&mut self) -> Result<Voice> {
-        let ref_latent = Array3::<f32>::zeros((1, 1, LATENT_DIM));
-        let ref_mask = Array2::from_elem((1, 1), false);
+        let ref_latent = Array3::<f32>::zeros((1, SPEAKER_PATCH_SIZE, LATENT_DIM));
+        let ref_mask = Array2::from_elem((1, SPEAKER_PATCH_SIZE), false);
         let out = self.speaker_encoder.run_with_options(
             ort::inputs!["ref_latent" => Tensor::from_array(ref_latent)?, "ref_mask" => Tensor::from_array(ref_mask)?],
             &self.run_options,
