@@ -4,14 +4,13 @@
 //! create it, register, and drop it to give the VRAM back.
 
 use ndarray::{Array2, Array3};
-use ort::execution_providers::{cuda::ConvAlgorithmSearch, ArenaExtendStrategy, CUDAExecutionProvider};
 use ort::session::{RunOptions, Session};
 use ort::value::Tensor;
 
 use crate::audio;
 use crate::engine::{EngineConfig, SAMPLE_RATE};
 use crate::voice::Voice;
-use crate::{Error, Result};
+use crate::{session, Error, Result};
 
 /// Samples per latent frame of the codec.
 const HOP: usize = 1920;
@@ -35,22 +34,6 @@ pub struct VoiceRegistrar {
     codec_encoder: Session,
     speaker_encoder: Session,
     run_options: RunOptions,
-}
-
-fn build_session(path: &std::path::Path, cuda_device: Option<i32>) -> Result<Session> {
-    let mut builder = Session::builder()?;
-    if let Some(device) = cuda_device {
-        let cuda = CUDAExecutionProvider::default()
-            .with_device_id(device)
-            .with_conv_algorithm_search(ConvAlgorithmSearch::Heuristic)
-            // Grow the memory arena by what is requested instead of by powers of two: with several sessions and inputs of every
-            // length, power-of-two growth left about a gigabyte of VRAM unused.
-            .with_arena_extend_strategy(ArenaExtendStrategy::SameAsRequested)
-            .build()
-            .error_on_failure();
-        builder = builder.with_execution_providers([cuda])?;
-    }
-    Ok(builder.commit_from_file(path)?)
 }
 
 impl VoiceRegistrar {
@@ -77,8 +60,9 @@ impl VoiceRegistrar {
             // tested in isolation with the same synthetic input, it agrees with CPU to ~0.3%, the
             // registration test's own large speaker_state error traced back entirely to it being fed
             // codec_encoder's already-wrong latent, not a problem of its own.
-            codec_encoder: build_session(&config.model_dir.join("codec_encoder.onnx"), config.cuda_device)?,
-            speaker_encoder: build_session(&config.model_dir.join(format!("speaker_encoder{suffix}.onnx")), config.cuda_device)?,
+            // `false`: see session::build_session's own doc for why, unlike Engine's sessions, these don't need it disabled.
+            codec_encoder: session::build_session(&config.model_dir.join("codec_encoder.onnx"), config.cuda_device, false)?,
+            speaker_encoder: session::build_session(&config.model_dir.join(format!("speaker_encoder{suffix}.onnx")), config.cuda_device, false)?,
             run_options,
         })
     }

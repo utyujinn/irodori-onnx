@@ -8,6 +8,7 @@ pub mod engine;
 pub mod postprocess;
 pub mod registrar;
 pub mod sampler;
+mod session;
 pub mod text;
 pub mod tokenizer;
 pub mod voice;

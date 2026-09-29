@@ -1,17 +1,16 @@
 //! The synthesis pipeline on ONNX Runtime:
 //! text -> tokens -> text encoder -> duration predictor -> MeanFlow sampler (DiT steps) -> codec decoder -> tail trim.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use ndarray::{s, Array2, Array3};
-use ort::execution_providers::{cuda::ConvAlgorithmSearch, ArenaExtendStrategy, CUDAExecutionProvider};
 use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
 use ort::session::{RunOptions, Session};
 use ort::value::{Tensor, TensorRef};
 
 use crate::tokenizer::TextTokenizer;
 use crate::voice::Voice;
-use crate::{postprocess, sampler, text, Error, Result};
+use crate::{postprocess, sampler, session, text, Error, Result};
 
 /// Output sample rate of the codec decoder.
 pub const SAMPLE_RATE: u32 = 48_000;
@@ -125,30 +124,6 @@ pub struct Engine {
     run_options: RunOptions,
 }
 
-fn build_session(path: &Path, cuda_device: Option<i32>) -> Result<Session> {
-    // Graph optimization is already at its max level (Level3/"All") by default (ort's own docs:
-    // "All optimizations are enabled by default") — nothing to configure there. Memory pattern
-    // optimization, on the other hand, is also on by default but ort's own doc for it says to turn
-    // it off "if the input size varies" — which is every call here: text length, frame count, and
-    // (since TASK.md #26) caption length are all different per request, never a stable batch shape
-    // to build a reusable memory plan around, so leaving it on works against its own assumption
-    // rather than helping.
-    let mut builder = Session::builder()?.with_memory_pattern(false)?;
-    if let Some(device) = cuda_device {
-        // HEURISTIC: the default exhaustive search benchmarks every new input shape, which stalls the decoder for minutes.
-        let cuda = CUDAExecutionProvider::default()
-            .with_device_id(device)
-            .with_conv_algorithm_search(ConvAlgorithmSearch::Heuristic)
-            // Grow the memory arena by what is requested instead of by powers of two: with several sessions and inputs of every
-            // length, power-of-two growth left about a gigabyte of VRAM unused.
-            .with_arena_extend_strategy(ArenaExtendStrategy::SameAsRequested)
-            .build()
-            .error_on_failure();
-        builder = builder.with_execution_providers([cuda])?;
-    }
-    Ok(builder.commit_from_file(path)?)
-}
-
 fn to_array3(value: &ort::value::DynValue) -> Result<Array3<f32>> {
     let (shape, data) = value.try_extract_tensor::<f32>()?;
     Ok(Array3::from_shape_vec((shape[0] as usize, shape[1] as usize, shape[2] as usize), data.to_vec())?)
@@ -174,7 +149,9 @@ impl Engine {
             ort::init_from(dylib.to_string_lossy().as_ref())?.commit();
         }
         let suffix = if config.fp16 { "_fp16" } else { "" };
-        let load = |name: &str| build_session(&config.model_dir.join(format!("{name}{suffix}.onnx")), config.cuda_device);
+        // See session::build_session's own doc for why Engine's sessions disable memory-pattern
+        // optimization (`true`) while VoiceRegistrar's do not.
+        let load = |name: &str| session::build_session(&config.model_dir.join(format!("{name}{suffix}.onnx")), config.cuda_device, true);
         let mut run_options = RunOptions::new()?;
         if let Some(device) = config.cuda_device {
             run_options.add_config_entry("memory.enable_memory_arena_shrinkage", format!("gpu:{device}"))?;
@@ -190,6 +167,8 @@ impl Engine {
         })
     }
 
+    /// text -> tokens -> text encoder -> duration predictor -> MeanFlow sampler -> codec decoder -> tail trim,
+    /// each stage delegated to a private method below in that order.
     pub fn synthesize(&mut self, text: &str, voice: &Voice, opts: &SynthOptions) -> Result<Synthesis> {
         let normalized = text::normalize_text(text);
         let normalized = normalized.trim();
@@ -200,17 +179,33 @@ impl Engine {
         let tokens = ids.len();
         let ids = Array2::from_shape_vec((1, tokens), ids.iter().map(|&i| i as i64).collect())?;
         let text_mask = Array2::from_elem((1, tokens), true);
-        // A caption's mask being all-False is what actually makes it a no-op downstream (both
-        // duration's masked-mean pooling and DiT's attention simply exclude masked-out caption
-        // tokens), not any property of caption_state's own values — that's why the no-caption case
-        // can reuse a fixed zero tensor for caption_state instead of running caption_encoder on an
-        // empty string: the Python export pipeline's own empty-caption baseline confirmed this
-        // (real_conditions() in irodori-onnx's export/common.py forces the mask to all-False by
-        // hand rather than relying on the encoder's actual output for ""). has_caption is a second,
-        // coarser gate the duration predictor alone reads (see _caption_vec in the Python model):
-        // it ANDs with caption_mask, so it's really just "ignore the caption entirely" spelled out
-        // as its own flag instead of relying on every mask entry happening to be False.
-        let (caption_state, caption_mask, has_caption) = match opts.caption.as_deref().map(str::trim) {
+
+        let (caption_state, caption_mask, has_caption) = self.encode_caption(opts.caption.as_deref())?;
+        let text_state = self.encode_text(ids, &text_mask)?;
+        let frames = self.predict_frames(normalized, tokens, &text_state, &text_mask, voice, &caption_state, &caption_mask, has_caption, opts)?;
+        let x = self.run_dit_loop(frames, &text_state, &text_mask, voice, &caption_state, &caption_mask, opts)?;
+
+        let mut samples = self.decode(&x, frames, opts)?;
+        postprocess_samples(&mut samples, opts);
+
+        let predicted_seconds = (frames * HOP) as f32 / SAMPLE_RATE as f32;
+        Ok(Synthesis { samples, sample_rate: SAMPLE_RATE, frames, predicted_seconds, latent: x })
+    }
+
+    /// `(caption_state, caption_mask, has_caption)` for an optional style instruction.
+    ///
+    /// A caption's mask being all-False is what actually makes it a no-op downstream (both
+    /// duration's masked-mean pooling and DiT's attention simply exclude masked-out caption
+    /// tokens), not any property of caption_state's own values — that's why the no-caption case
+    /// can reuse a fixed zero tensor for caption_state instead of running caption_encoder on an
+    /// empty string: the Python export pipeline's own empty-caption baseline confirmed this
+    /// (real_conditions() in irodori-onnx's export/common.py forces the mask to all-False by
+    /// hand rather than relying on the encoder's actual output for ""). has_caption is a second,
+    /// coarser gate the duration predictor alone reads (see _caption_vec in the Python model):
+    /// it ANDs with caption_mask, so it's really just "ignore the caption entirely" spelled out
+    /// as its own flag instead of relying on every mask entry happening to be False.
+    fn encode_caption(&mut self, caption: Option<&str>) -> Result<(Array3<f32>, Array2<bool>, bool)> {
+        match caption.map(str::trim) {
             Some(caption) if !caption.is_empty() => {
                 let cap_ids = self.tokenizer.encode(caption, MAX_CAPTION_LEN)?;
                 let cap_tokens = cap_ids.len();
@@ -220,39 +215,64 @@ impl Engine {
                     ort::inputs!["input_ids" => Tensor::from_array(cap_ids)?, "mask" => TensorRef::from_array_view(cap_mask.view())?],
                     &self.run_options,
                 )?;
-                (to_array3(&out[0])?, cap_mask, true)
+                Ok((to_array3(&out[0])?, cap_mask, true))
             }
-            _ => (Array3::<f32>::zeros((1, 1, CAPTION_DIM)), Array2::from_elem((1, 1), false), false),
-        };
+            _ => Ok((Array3::<f32>::zeros((1, 1, CAPTION_DIM)), Array2::from_elem((1, 1), false), false)),
+        }
+    }
 
-        let text_state = {
-            let out = self.text_encoder.run_with_options(
-                ort::inputs!["input_ids" => Tensor::from_array(ids)?, "mask" => TensorRef::from_array_view(text_mask.view())?],
-                &self.run_options,
-            )?;
-            to_array3(&out[0])?
-        };
+    fn encode_text(&mut self, ids: Array2<i64>, text_mask: &Array2<bool>) -> Result<Array3<f32>> {
+        let out = self.text_encoder.run_with_options(
+            ort::inputs!["input_ids" => Tensor::from_array(ids)?, "mask" => TensorRef::from_array_view(text_mask.view())?],
+            &self.run_options,
+        )?;
+        to_array3(&out[0])
+    }
 
-        let frames = {
-            let features = text::duration_features(normalized, tokens, MAX_TEXT_LEN, true);
-            let out = self.duration.run_with_options(
-                ort::inputs![
-                    "text_state" => TensorRef::from_array_view(text_state.view())?,
-                    "text_mask" => TensorRef::from_array_view(text_mask.view())?,
-                    "speaker_state" => TensorRef::from_array_view(voice.state.view())?,
-                    "speaker_mask" => TensorRef::from_array_view(voice.mask.view())?,
-                    "duration_features" => Tensor::from_array(Array2::from_shape_vec((1, features.len()), features.to_vec())?)?,
-                    "has_speaker" => Tensor::from_array(ndarray::arr1(&[true]))?,
-                    "caption_state" => TensorRef::from_array_view(caption_state.view())?,
-                    "caption_mask" => TensorRef::from_array_view(caption_mask.view())?,
-                    "has_caption" => Tensor::from_array(ndarray::arr1(&[has_caption]))?
-                ],
-                &self.run_options,
-            )?;
-            let (_, log_frames) = out[0].try_extract_tensor::<f32>()?;
-            frames_from_prediction(log_frames[0], opts)
-        };
+    #[allow(clippy::too_many_arguments)]
+    fn predict_frames(
+        &mut self,
+        normalized: &str,
+        tokens: usize,
+        text_state: &Array3<f32>,
+        text_mask: &Array2<bool>,
+        voice: &Voice,
+        caption_state: &Array3<f32>,
+        caption_mask: &Array2<bool>,
+        has_caption: bool,
+        opts: &SynthOptions,
+    ) -> Result<usize> {
+        let features = text::duration_features(normalized, tokens, MAX_TEXT_LEN, true);
+        let out = self.duration.run_with_options(
+            ort::inputs![
+                "text_state" => TensorRef::from_array_view(text_state.view())?,
+                "text_mask" => TensorRef::from_array_view(text_mask.view())?,
+                "speaker_state" => TensorRef::from_array_view(voice.state.view())?,
+                "speaker_mask" => TensorRef::from_array_view(voice.mask.view())?,
+                "duration_features" => Tensor::from_array(Array2::from_shape_vec((1, features.len()), features.to_vec())?)?,
+                "has_speaker" => Tensor::from_array(ndarray::arr1(&[true]))?,
+                "caption_state" => TensorRef::from_array_view(caption_state.view())?,
+                "caption_mask" => TensorRef::from_array_view(caption_mask.view())?,
+                "has_caption" => Tensor::from_array(ndarray::arr1(&[has_caption]))?
+            ],
+            &self.run_options,
+        )?;
+        let (_, log_frames) = out[0].try_extract_tensor::<f32>()?;
+        Ok(frames_from_prediction(log_frames[0], opts))
+    }
 
+    /// Runs the `opts.steps` MeanFlow sampler steps and returns the final latent `x`.
+    #[allow(clippy::too_many_arguments)]
+    fn run_dit_loop(
+        &mut self,
+        frames: usize,
+        text_state: &Array3<f32>,
+        text_mask: &Array2<bool>,
+        voice: &Voice,
+        caption_state: &Array3<f32>,
+        caption_mask: &Array2<bool>,
+        opts: &SynthOptions,
+    ) -> Result<Array3<f32>> {
         let mut x = match &opts.noise {
             Some(noise) if noise.shape() == [1, frames, LATENT_DIM] => noise.clone(),
             Some(noise) => return Err(Error::Model(format!("injected noise has shape {:?}, expected [1, {frames}, {LATENT_DIM}]", noise.shape()))),
@@ -294,7 +314,12 @@ impl Engine {
                 *xi += vi * dt;
             }
         }
+        Ok(x)
+    }
 
+    /// Runs the codec decoder and applies `trim_tail` (the only postprocessing step that needs
+    /// the latent rather than just the decoded waveform, see [`postprocess_samples`] for the rest).
+    fn decode(&mut self, x: &Array3<f32>, frames: usize, opts: &SynthOptions) -> Result<Vec<f32>> {
         let mut samples = {
             let out = self.decoder.run_with_options(ort::inputs!["latent" => TensorRef::from_array_view(x.view())?], &self.run_options)?;
             let (_, audio) = out[0].try_extract_tensor::<f32>()?;
@@ -308,29 +333,34 @@ impl Engine {
             }
         }
         samples.truncate(max_samples);
-        if opts.trim_trailing_silence {
-            // Same window/threshold as trim_leading_silence below, for the same reasons; a larger
-            // margin than that one's cap, kept past the last real sound, since a breath or a
-            // consonant's natural decay trailing off is still part of the utterance, not padding.
-            let window = (0.01 * SAMPLE_RATE as f32) as usize;
-            let margin = (0.15 * SAMPLE_RATE as f32) as usize;
-            let cut = postprocess::trailing_silence(&samples, window, 0.01, margin);
-            samples.truncate(cut);
-        }
-        if opts.fade_out_ms > 0.0 {
-            postprocess::fade_out(&mut samples, (opts.fade_out_ms / 1000.0 * SAMPLE_RATE as f32) as usize);
-        }
-        if opts.trim_leading_silence {
-            // A window short enough to not eat into a genuine soft onset, a threshold well below
-            // normal speech level, and a cap far more generous than any pre-speech lead-in the
-            // model has been observed to produce, so a mistuned detector fails safe (too little
-            // trimmed) rather than clipping real content.
-            let window = (0.01 * SAMPLE_RATE as f32) as usize;
-            let cap = (0.4 * SAMPLE_RATE as f32) as usize;
-            let lead = postprocess::leading_silence(&samples, window, 0.01, cap);
-            samples.drain(..lead);
-        }
-        let predicted_seconds = (frames * HOP) as f32 / SAMPLE_RATE as f32;
-        Ok(Synthesis { samples, sample_rate: SAMPLE_RATE, frames, predicted_seconds, latent: x })
+        Ok(samples)
+    }
+}
+
+/// The optional postprocessing steps beyond `trim_tail` (already applied in [`Engine::decode`]
+/// since it alone needs the latent, not just the waveform), in the order `synthesize` used to
+/// apply them inline: trailing-silence trim, fade-out, leading-silence trim.
+fn postprocess_samples(samples: &mut Vec<f32>, opts: &SynthOptions) {
+    if opts.trim_trailing_silence {
+        // Same window/threshold as trim_leading_silence below, for the same reasons; a larger
+        // margin than that one's cap, kept past the last real sound, since a breath or a
+        // consonant's natural decay trailing off is still part of the utterance, not padding.
+        let window = (0.01 * SAMPLE_RATE as f32) as usize;
+        let margin = (0.15 * SAMPLE_RATE as f32) as usize;
+        let cut = postprocess::trailing_silence(samples, window, 0.01, margin);
+        samples.truncate(cut);
+    }
+    if opts.fade_out_ms > 0.0 {
+        postprocess::fade_out(samples, (opts.fade_out_ms / 1000.0 * SAMPLE_RATE as f32) as usize);
+    }
+    if opts.trim_leading_silence {
+        // A window short enough to not eat into a genuine soft onset, a threshold well below
+        // normal speech level, and a cap far more generous than any pre-speech lead-in the
+        // model has been observed to produce, so a mistuned detector fails safe (too little
+        // trimmed) rather than clipping real content.
+        let window = (0.01 * SAMPLE_RATE as f32) as usize;
+        let cap = (0.4 * SAMPLE_RATE as f32) as usize;
+        let lead = postprocess::leading_silence(samples, window, 0.01, cap);
+        samples.drain(..lead);
     }
 }
